@@ -19,10 +19,11 @@ setup(
                 "ext.cpp",
             ],
             extra_compile_args={
+                "cxx": ["-std=c++20"],
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
-                    "-std=c++17",
+                    "-std=c++20",
                     "--extended-lambda",
                     # "--Werror=all-warnings",
                     "--expt-relaxed-constexpr",

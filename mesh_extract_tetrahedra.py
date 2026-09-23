@@ -17,7 +17,7 @@ from gaussian_renderer import (
 )
 from scene import Scene
 from tetranerf.utils.extension import cpp
-from utils.tetmesh import marching_tetrahedra
+from utils.tetmesh import InsufficientMarchingMemory, marching_tetrahedra
 
 
 def post_process_mesh(mesh, cluster_to_keep=1):
@@ -190,6 +190,7 @@ def marching_tetrahedra_with_binary_search(
     background,
     export_color,
     move_cpu,
+    save_cells,
     num_cluster,
 ):
     # generate tetra points here
@@ -197,42 +198,29 @@ def marching_tetrahedra_with_binary_search(
 
     print("construct cell")
     cells = cpp.triangulate(points)
-    torch.save(cells, os.path.join(model_path, "cells.pt"))
-    # if os.path.exists(os.path.join(model_path, "cells.pt")):
-    #     print("load existing cells")
-    #     cells = torch.load(os.path.join(model_path, "cells.pt"))
-    # else:
-    #     # create cell and save cells
-    #     print("create cells and save")
-    #     cells = cpp.triangulate(points)
-    #     # we should filter the cell if it is larger than the gaussians
-    #     torch.save(cells, os.path.join(model_path, "cells.pt"))
+    if move_cpu:
+        cells = cells.cpu()
+    if save_cells:
+        torch.save(cells.cpu(), os.path.join(model_path, "cells.pt"))
 
     sdf, valid = evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size)
 
     torch.cuda.empty_cache()
-    # the function marching_tetrahedra costs much memory, so we move it to cpu.
-    if move_cpu:
-        verts_list, scale_list, faces_list, _ = marching_tetrahedra(
-            points.cpu()[None],
-            cells.cpu().long(),
-            sdf[None].cpu(),
-            points_scale[None].cpu(),
-            valid[None].cpu(),
+    try:
+        (end_points, end_sdf), end_scales, faces, _ = marching_tetrahedra(
+            points, cells, sdf, points_scale, valid
         )
-    else:
-        verts_list, scale_list, faces_list, _ = marching_tetrahedra(
-            points[None], cells.long(), sdf[None], points_scale[None], valid[None]
+    except (InsufficientMarchingMemory, torch.cuda.OutOfMemoryError):
+        if not cells.is_cuda:
+            raise
+        print("GPU edge sort exceeds available memory; streaming cells through CUDA instead")
+        cells = cells.cpu()
+        torch.cuda.empty_cache()
+        (end_points, end_sdf), end_scales, faces, _ = marching_tetrahedra(
+            points, cells, sdf, points_scale, valid
         )
-    end_points, end_sdf = verts_list[0]
-    end_scales = scale_list[0]
-    end_points, end_sdf, end_scales = (
-        end_points.cuda(),
-        end_sdf.cuda(),
-        end_scales.cuda(),
-    )
 
-    faces = faces_list[0].cpu().numpy()
+    faces = faces.cpu().numpy()
     points = (end_points[:, 0, :] + end_points[:, 1, :]) * 0.5
 
     mesh = trimesh.Trimesh(vertices=points.cpu().numpy(), faces=faces, process=False)
@@ -314,6 +302,7 @@ def extract_mesh(
     pipeline: PipelineParams,
     export_color: bool,
     move_cpu: bool,
+    save_cells: bool,
     num_cluster: int,
 ):
     with torch.no_grad():
@@ -333,6 +322,7 @@ def extract_mesh(
             background,
             export_color,
             move_cpu,
+            save_cells,
             num_cluster,
         )
 
@@ -344,7 +334,8 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--num_cluster", default=1, type=int)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--move_cpu", action="store_true")
+    parser.add_argument("--move_cpu", action="store_true", help="Keep cells and edge deduplication on the CPU")
+    parser.add_argument("--save_cells", action="store_true", help="Save the large tetrahedral cell array to cells.pt")
     parser.add_argument("--export_color", action="store_true")
     args = get_combined_args(parser)
 
@@ -354,5 +345,6 @@ if __name__ == "__main__":
         pipeline.extract(args),
         args.export_color,
         args.move_cpu,
+        args.save_cells,
         args.num_cluster,
     )

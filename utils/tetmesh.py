@@ -16,9 +16,19 @@
 # limitations under the License.
 
 import gc
+import os
+import tempfile
+
+import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 __all__ = ["marching_tetrahedra"]
+
+
+class InsufficientMarchingMemory(RuntimeError):
+    """The resident edge sort would exceed the available CUDA memory."""
 
 triangle_table = torch.tensor(
     [
@@ -47,195 +57,180 @@ base_tet_edges = torch.tensor([0, 1, 0, 2, 0, 3, 1, 2, 1, 3, 2, 3], dtype=torch.
 v_id = torch.pow(2, torch.arange(4, dtype=torch.long))
 
 
-@torch.no_grad()
-def _unbatched_marching_tetrahedra(tets, sdf, valids):
-    device = tets.device
-    occ_n = sdf > 0
-    occ_fx4 = occ_n[tets]
-    occ_sum = torch.sum(occ_fx4, -1)
-    valid_fx4 = valids[tets]
-
-    valid_tets = (occ_sum > 0) & (occ_sum < 4) & valid_fx4.all(dim=-1)
-
-    all_edges = tets[valid_tets][:, base_tet_edges.to(device)].reshape(-1, 2)
-
-    order = (all_edges[:, 0] > all_edges[:, 1]).bool()
-    all_edges[order] = all_edges[order][:, [1, 0]]
-
-    unique_edges, idx_map = torch.unique(all_edges, dim=0, return_inverse=True)
-
-    unique_edges = unique_edges.long()
-    mask_edges = occ_n[unique_edges].sum(-1) == 1
-    mapping = torch.full((unique_edges.shape[0],), -1, dtype=torch.long, device=device)
-    mapping[mask_edges] = torch.arange(mask_edges.sum(), dtype=torch.long, device=device)
-    idx_map = mapping[idx_map]
-    interp_v = unique_edges[mask_edges]
-    idx_map = idx_map.reshape(-1, 6)
-    tetindex = (occ_fx4[valid_tets] * v_id.to(device).unsqueeze(0)).sum(-1)
-    num_triangles = num_triangles_table.to(device)[tetindex]
-    triangle_table_device = triangle_table.to(device)
-
-    # Generate triangle indices
-    faces = torch.cat(
-        (
-            torch.gather(input=idx_map[num_triangles == 1], dim=1, index=triangle_table_device[tetindex[num_triangles == 1]][:, :3]).reshape(-1, 3),
-            torch.gather(input=idx_map[num_triangles == 2], dim=1, index=triangle_table_device[tetindex[num_triangles == 2]][:, :6]).reshape(-1, 3),
-        ),
-        dim=0,
-    )
-
-    return faces, interp_v
+@triton.jit
+def _count_surface_triangles(tets, sdf, valids, triangle_counts, count_table, n: tl.constexpr, block: tl.constexpr):
+    row = tl.program_id(0) * block + tl.arange(0, block)
+    inside = row < n
+    a = tl.load(tets + 4 * row, inside, other=0)
+    b = tl.load(tets + 4 * row + 1, inside, other=0)
+    c = tl.load(tets + 4 * row + 2, inside, other=0)
+    d = tl.load(tets + 4 * row + 3, inside, other=0)
+    case = (tl.load(sdf + a) > 0).to(tl.int32)
+    case += 2 * (tl.load(sdf + b) > 0).to(tl.int32)
+    case += 4 * (tl.load(sdf + c) > 0).to(tl.int32)
+    case += 8 * (tl.load(sdf + d) > 0).to(tl.int32)
+    valid = tl.load(valids + a) & tl.load(valids + b)
+    valid &= tl.load(valids + c) & tl.load(valids + d)
+    count = tl.where(valid, tl.load(count_table + case), 0)
+    tl.store(triangle_counts + row, count, inside)
 
 
-def unbatched_marching_tetrahedra(vertices, tets, sdf, scales, valids):
-    """unbatched marching tetrahedra.
-
-    Refer to :func:`marching_tetrahedra`.
-    """
-    # construct a function to recycle the unused memory
-    def inner_func():
-        device = vertices.device
-
-        # call by chunk
-        chunk_size = 32 * 512 * 512
-
-        keys_merged = None  # (M,2) edge ids in *storage order* (append-only)
-        for tet_chunk in torch.chunk(tets, tets.shape[0] // chunk_size + 1):
-            faces_new, ids_new_2 = _unbatched_marching_tetrahedra(tet_chunk, sdf, valids)
-            torch.cuda.empty_cache()
-
-            device = ids_new_2.device
-            # faces_new = faces_new.long()
-
-            # pack (E,2) -> (E,) int64
-            a = ids_new_2[:, 0].to(torch.int64)
-            b = ids_new_2[:, 1].to(torch.int64)
-
-            keys_new = (a << 32) | (b & 0xFFFF_FFFF)  # (V,)
-
-            if keys_merged is None:
-                # initialize: keep merged keys sorted, and remap faces accordingly
-                perm = torch.argsort(keys_new)
-                keys_merged = keys_new[perm]  # (M,) sorted unique
-
-                inv = torch.empty_like(perm)
-                inv[perm] = torch.arange(perm.numel(), device=device)
-                faces_merged = inv[faces_new]
-                continue
-
-            # -------- merge into existing (keys_merged sorted unique) --------
-            M = keys_merged.numel()
-            V = keys_new.numel()
-
-            # find existing edges
-            pos = torch.searchsorted(keys_merged, keys_new)  # (V,)
-            pos_safe = pos.clamp_max(M - 1)
-            exists = keys_merged[pos_safe] == keys_new
-
-            # add truly new edges (keep sorted)
-            add_mask = ~exists
-            add_n = int(add_mask.sum().item())
-
-            if add_n == 0:
-                # only need to append faces, mapping each new edge to its merged index (=pos)
-                map_edge = pos  # (V,)
-                faces_merged = torch.cat([faces_merged, map_edge[faces_new]], dim=0)
-                continue
-
-            add_idx = torch.nonzero(add_mask, as_tuple=False).squeeze(1)  # (add_n,)
-            add_keys = keys_new[add_idx]
-            add_perm = torch.argsort(add_keys)
-            add_idx = add_idx[add_perm]
-            add_keys = add_keys[add_perm]  # sorted
-
-            # insertion positions into old merged keys
-            ins = torch.searchsorted(keys_merged, add_keys).to(torch.long)  # (add_n,) nondecreasing
-
-            # compute how much each old index shifts right after insertions
-            delta = torch.zeros((M + 1,), device=device, dtype=torch.int32)
-            delta.scatter_add_(0, ins, torch.ones((add_n,), device=device, dtype=torch.int32))
-            shift = torch.cumsum(delta, dim=0)[:-1].to(torch.long)  # (M,)
-
-            old_to_new = torch.arange(M, device=device, dtype=torch.long) + shift  # (M,)
-            # add_to_new = ins + torch.arange(add_n, device=device, dtype=torch.long)  # (add_n,)
-            add_to_new = ins.add_(torch.arange(add_n, device=device, dtype=torch.long))
-
-            U = M + add_n
-            keys2 = torch.empty((U,), device=device, dtype=keys_merged.dtype)
-            keys2[old_to_new] = keys_merged
-            keys2[add_to_new] = add_keys
-            keys_merged = keys2
-
-            faces_merged.add_(shift[faces_merged])
-            map_edge = torch.empty((V,), device=device, dtype=torch.long)
-            map_edge[exists] = pos[exists] + shift[pos[exists]]
-            map_edge[add_idx] = add_to_new  # note: add_idx is in original new-edge order
-            faces_merged = torch.cat([faces_merged, map_edge[faces_new]], dim=0)
-            torch.cuda.empty_cache()
-        return keys_merged, ids_new_2, faces_merged
-
-    keys_merged, ids_new_2, faces_merged = inner_func()
-    gc.collect()
-    torch.cuda.empty_cache()
-    mask = torch.tensor(0xFFFF_FFFF, device=keys_merged.device, dtype=torch.int64)
-    i = (keys_merged >> 32) & mask
-    j = keys_merged & mask
-    merged_verts_ids = torch.stack([i, j], dim=1).to(ids_new_2.dtype)  # (E,2)
-    edges_to_interp = vertices[merged_verts_ids.reshape(-1)].reshape(-1, 2, 3)
-    edges_to_interp_sdf = sdf[merged_verts_ids.reshape(-1)].reshape(-1, 2, 1)
-    merged_scales = scales[merged_verts_ids.reshape(-1)].reshape(-1, 2, 1)
-    merged_verts = (edges_to_interp, edges_to_interp_sdf)
-
-    return merged_verts, merged_scales, faces_merged, merged_verts_ids
+@triton.jit
+def _emit_surface_edge_keys(tets, sdf, triangle_counts, offsets, triangle_edges, base_edges,
+                            out_keys, n: tl.constexpr, block: tl.constexpr):
+    row = tl.program_id(0) * block + tl.arange(0, block)
+    inside = row < n
+    a = tl.load(tets + 4 * row, inside, other=0)
+    b = tl.load(tets + 4 * row + 1, inside, other=0)
+    c = tl.load(tets + 4 * row + 2, inside, other=0)
+    d = tl.load(tets + 4 * row + 3, inside, other=0)
+    case = (tl.load(sdf + a) > 0).to(tl.int32)
+    case += 2 * (tl.load(sdf + b) > 0).to(tl.int32)
+    case += 4 * (tl.load(sdf + c) > 0).to(tl.int32)
+    case += 8 * (tl.load(sdf + d) > 0).to(tl.int32)
+    count = tl.load(triangle_counts + row, inside, other=0)
+    start = tl.load(offsets + row, inside, other=0) - count
+    for slot in range(6):
+        write = inside & (slot < 3 * count)
+        edge = tl.load(triangle_edges + 6 * case + slot, write, other=0)
+        first = tl.load(base_edges + 2 * edge, write, other=0)
+        second = tl.load(base_edges + 2 * edge + 1, write, other=0)
+        lo_vertex = tl.where(first == 0, a, tl.where(first == 1, b, tl.where(first == 2, c, d)))
+        hi_vertex = tl.where(second == 0, a, tl.where(second == 1, b, tl.where(second == 2, c, d)))
+        lo = tl.minimum(lo_vertex, hi_vertex).to(tl.uint64)
+        hi = tl.maximum(lo_vertex, hi_vertex).to(tl.uint64)
+        key = (lo << 32) | hi
+        tl.store(out_keys + 3 * start + slot, key.to(tl.int64), write)
 
 
 @torch.no_grad()
-def marching_tetrahedra(vertices, tets, sdf, scales, valids):
-    r"""Convert discrete signed distance fields encoded on tetrahedral grids to triangle
-    meshes using marching tetrahedra algorithm as described in `An efficient method of
-    triangulating equi-valued surfaces by using tetrahedral cells`_. The output surface is differentiable with respect to
-    input vertex positions and the SDF values. For more details and example usage in learning, see
-    `Deep Marching Tetrahedra\: a Hybrid Representation for High-Resolution 3D Shape Synthesis`_ NeurIPS 2021.
+def marching_tetrahedra(vertices, tets, sdf, scales, valids, chunk_size=262144):
+    """Extract a single mesh with bounded CUDA workspace.
 
-
-    Args:
-        vertices (torch.tensor): batched vertices of tetrahedral meshes, of shape
-                                 :math:`(\text{batch_size}, \text{num_vertices}, 3)`.
-        tets (torch.tensor): unbatched tetrahedral mesh topology, of shape
-                             :math:`(\text{num_tetrahedrons}, 4)`.
-        sdf (torch.tensor): batched SDFs which specify the SDF value of each vertex, of shape
-                            :math:`(\text{batch_size}, \text{num_vertices})`.
-
-    Returns:
-        (list[torch.Tensor], list[torch.LongTensor], (optional) list[torch.LongTensor]):
-
-            - the list of vertices for mesh converted from each tetrahedral grid.
-            - the list of faces for mesh converted from each tetrahedral grid.
-
-    Example:
-        >>> vertices = torch.tensor([[[0, 0, 0],
-        ...               [1, 0, 0],
-        ...               [0, 1, 0],
-        ...               [0, 0, 1]]], dtype=torch.float)
-        >>> tets = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
-        >>> sdf = torch.tensor([[-1., -1., 0.5, 0.5]], dtype=torch.float)
-        >>> verts_list, faces_list, tet_idx_list = marching_tetrahedra(vertices, tets, sdf, True)
-        >>> verts_list[0]
-        tensor([[0.0000, 0.6667, 0.0000],
-                [0.0000, 0.0000, 0.6667],
-                [0.3333, 0.6667, 0.0000],
-                [0.3333, 0.0000, 0.6667]])
-        >>> faces_list[0]
-        tensor([[3, 0, 1],
-                [3, 2, 0]])
-        >>> tet_idx_list[0]
-        tensor([0, 0])
-
-    .. _An efficient method of triangulating equi-valued surfaces by using tetrahedral cells:
-        https://search.ieice.org/bin/summary.php?id=e74-d_1_214
-
-    .. _Deep Marching Tetrahedra\: a Hybrid Representation for High-Resolution 3D Shape Synthesis:
-            https://arxiv.org/abs/2111.04276
+    GPU tetrahedra remain resident on the device through edge deduplication.
+    CPU tetrahedra use a bounded streaming path and deduplicate once on the
+    host. Output faces and edge IDs follow the tetrahedra device; endpoint
+    data follows ``vertices.device``.
     """
-    list_of_outputs = [unbatched_marching_tetrahedra(vertices[b], tets, sdf[b], scales[b], valids[b]) for b in range(vertices.shape[0])]
-    return list(zip(*list_of_outputs))
+    if not vertices.is_cuda or not sdf.is_cuda or not valids.is_cuda:
+        raise ValueError("streaming marching tetrahedra requires CUDA vertex, SDF and validity tensors")
+    if tets.dtype != torch.int32 or tets.ndim != 2 or tets.shape[1] != 4:
+        raise ValueError("tets must be an int32 tensor of shape [N, 4]")
+    if vertices.shape[0] >= 2**31:
+        raise ValueError("int32 tetrahedron indices require fewer than 2^31 vertices")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    device = vertices.device
+    sdf = sdf.contiguous()
+    valids = valids.contiguous()
+    count_table = num_triangles_table.to(device=device, dtype=torch.int32)
+    face_table = triangle_table.to(device=device, dtype=torch.int32).contiguous()
+    edges_table = base_tet_edges.to(device=device, dtype=torch.int32)
+
+    if tets.is_cuda:
+        if tets.device != device:
+            raise ValueError("tets and vertices must be on the same CUDA device")
+        tets = tets.contiguous()
+        face_count = 0
+        for start in range(0, tets.shape[0], chunk_size):
+            tet_chunk = tets[start:start + chunk_size]
+            n = tet_chunk.shape[0]
+            counts = torch.empty(n, device=device, dtype=torch.int32)
+            _count_surface_triangles[(triton.cdiv(n, 256),)](
+                tet_chunk, sdf, valids, counts, count_table, n, 256)
+            face_count += int(counts.sum().item())
+
+        if face_count == 0:
+            ids = torch.empty((0, 2), dtype=torch.int32, device=device)
+            faces = torch.empty((0, 3), dtype=torch.int32, device=device)
+        else:
+            # torch.unique needs sorting workspace in addition to the key
+            # array and inverse map. Fail early with a useful CPU option.
+            key_bytes = face_count * 3 * 8
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            if free_bytes < 7 * key_bytes + 2 * 2**30:
+                raise InsufficientMarchingMemory("Not enough free GPU memory for resident edge deduplication")
+            keys = torch.empty(face_count * 3, device=device, dtype=torch.int64)
+            face_offset = 0
+            for start in range(0, tets.shape[0], chunk_size):
+                tet_chunk = tets[start:start + chunk_size]
+                n = tet_chunk.shape[0]
+                counts = torch.empty(n, device=device, dtype=torch.int32)
+                _count_surface_triangles[(triton.cdiv(n, 256),)](
+                    tet_chunk, sdf, valids, counts, count_table, n, 256)
+                offsets = counts.cumsum(0, dtype=torch.int32)
+                n_faces = int(offsets[-1].item())
+                if n_faces:
+                    _emit_surface_edge_keys[(triton.cdiv(n, 256),)](
+                        tet_chunk, sdf, counts, offsets, face_table, edges_table,
+                        keys[3 * face_offset:], n, 256)
+                    face_offset += n_faces
+            unique_keys, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+            del keys
+            if unique_keys.numel() >= 2**31:
+                raise ValueError("mesh has too many unique edges for int32 faces")
+            faces = inverse.to(torch.int32).reshape(-1, 3)
+            del inverse
+            ids = torch.stack((unique_keys >> 32, unique_keys & 0xFFFF_FFFF), dim=1).to(torch.int32)
+            del unique_keys
+    else:
+        tets = tets.cpu().contiguous()
+        ids, faces = _marching_tetrahedra_cpu_keys(
+            tets, sdf, valids, count_table, face_table, edges_table, chunk_size, device
+        )
+
+    n_edges = ids.shape[0]
+    end_points = torch.empty((n_edges, 2, 3), dtype=vertices.dtype, device=device)
+    end_sdf = torch.empty((n_edges, 2, 1), dtype=sdf.dtype, device=device)
+    end_scales = torch.empty((n_edges, 2, 1), dtype=scales.dtype, device=device)
+    for start in range(0, n_edges, chunk_size):
+        stop = min(start + chunk_size, n_edges)
+        endpoint_ids = ids[start:stop].to(device=device, dtype=torch.long)
+        end_points[start:stop] = vertices[endpoint_ids]
+        end_sdf[start:stop, :, 0] = sdf[endpoint_ids]
+        end_scales[start:stop, :, 0] = scales[endpoint_ids, 0]
+
+    return (end_points, end_sdf), end_scales, faces, ids
+
+
+def _marching_tetrahedra_cpu_keys(tets, sdf, valids, count_table, face_table, edges_table, chunk_size, device):
+    with tempfile.TemporaryDirectory(prefix="marching_tetrahedra_") as temp_dir:
+        key_path = os.path.join(temp_dir, "face_edge_keys.bin")
+        face_count = 0
+        with open(key_path, "wb") as key_file:
+            for start in range(0, tets.shape[0], chunk_size):
+                tet_chunk = tets[start:start + chunk_size].to(device)
+                n = tet_chunk.shape[0]
+                counts = torch.empty(n, device=device, dtype=torch.int32)
+                _count_surface_triangles[(triton.cdiv(n, 256),)](
+                    tet_chunk, sdf, valids, counts, count_table, n, 256)
+                offsets = counts.cumsum(0, dtype=torch.int32)
+                n_faces = int(offsets[-1].item())
+                if n_faces:
+                    keys = torch.empty(n_faces * 3, device=device, dtype=torch.int64)
+                    _emit_surface_edge_keys[(triton.cdiv(n, 256),)](
+                        tet_chunk, sdf, counts, offsets, face_table, edges_table,
+                        keys, n, 256)
+                    keys.cpu().numpy().tofile(key_file)
+                    face_count += n_faces
+                    del keys
+                del tet_chunk, counts, offsets
+
+        if face_count == 0:
+            ids = torch.empty((0, 2), dtype=torch.int32)
+            faces = torch.empty((0, 3), dtype=torch.int32)
+        else:
+            keys = np.memmap(key_path, dtype=np.int64, mode="r", shape=(face_count * 3,))
+            unique_keys, inverse = np.unique(keys, return_inverse=True)
+            if len(unique_keys) >= 2**31:
+                raise ValueError("mesh has too many unique edges for int32 faces")
+            ids_np = np.empty((len(unique_keys), 2), dtype=np.int32)
+            ids_np[:, 0] = unique_keys >> 32
+            ids_np[:, 1] = unique_keys & 0xFFFF_FFFF
+            ids = torch.from_numpy(ids_np)
+            faces = torch.from_numpy(inverse.astype(np.int32, copy=False).reshape(-1, 3))
+            del keys, unique_keys, inverse
+
+    return ids, faces
+

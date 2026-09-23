@@ -1,7 +1,7 @@
 ulimit -n 4096
 dataset_folder=/media/baowen/data/dataset/tnt_official
 scenes=(Barn Caterpillar Ignatius Meetingroom Truck Courthouse)
-move_cpus=(0 0 1 1 1 1)
+move_cpus=(0 0 0 0 0 0)
 devices=(cuda cuda cuda cuda cuda cuda)
 
 

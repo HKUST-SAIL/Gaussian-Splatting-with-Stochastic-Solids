@@ -1,6 +1,8 @@
-# Geometry-Grounded Gaussian Splatting
+# Grounding Gaussian Splatting Geometry with Stochastic Solids
 
 **Baowen Zhang, Chenxing Jiang, Heng Li, Shaojie Shen, Ping Tan**
+
+### SIGGRAPH Asia 2026
 
 [Project Page](https://baowenz.github.io/geometry_grounded_gaussian_splatting/)  
 ![Teaser](assets/teaser.jpg)
@@ -13,19 +15,19 @@ The code has been tested on Ubuntu 24.04 with CUDA 13.0 (driver 580.126.09), and
 
 ### Clone the repository
 ```bash
-git clone https://github.com/HKUST-SAIL/Geometry-Grounded-Gaussian-Splatting.git --recursive
-cd Geometry-Grounded-Gaussian-Splatting
+git clone https://github.com/HKUST-SAIL/Gaussian-Splatting-with-Stochastic-Solids.git --recursive
+cd Gaussian-Splatting-with-Stochastic-Solids
 ```
 
 ### Create the environment
 ```bash
-conda create -n gggs python=3.12
-conda activate gggs
+conda create -n gggss python=3.12
+conda activate gggss
 ```
 
 ### Install PyTorch + dependencies
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip3 install torch torchvision
 pip install -r requirements.txt
 ```
 

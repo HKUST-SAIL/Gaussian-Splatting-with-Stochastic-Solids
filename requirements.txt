@@ -1,6 +1,8 @@
 open3d
 trimesh
 scikit-image
+scikit-learn
 opencv-python
 plyfile
 tqdm
+matplotlib

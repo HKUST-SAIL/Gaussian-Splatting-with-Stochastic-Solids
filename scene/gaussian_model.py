@@ -185,31 +185,21 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
 
+    def _filtered_scaling_and_coef(self):
+        scales = self.get_scaling
+        filtered_scales = torch.hypot(scales, self.filter_3D)
+        coef = (scales / filtered_scales).prod(dim=1, keepdim=True)
+        return filtered_scales, coef
+
     @property
     def get_opacity_with_3D_filter(self):
-        opacity = self.opacity_activation(self._opacity)
-        # apply 3D filter
-        scales = self.get_scaling
-
-        scales_square = torch.square(scales)
-        det1 = scales_square.prod(dim=1)
-
-        scales_after_square = scales_square + torch.square(self.filter_3D)
-        det2 = scales_after_square.prod(dim=1)
-        coef = torch.sqrt(det1 / det2)
-        return opacity * coef[..., None]
+        _, coef = self._filtered_scaling_and_coef()
+        return self.get_opacity * coef
 
     @property
     def get_scaling_n_opacity_with_3D_filter(self):
-        opacity = self.opacity_activation(self._opacity)
-        scales = self.get_scaling
-        scales_square = torch.square(scales)
-        det1 = scales_square.prod(dim=1)
-        scales_after_square = scales_square + torch.square(self.filter_3D)
-        det2 = scales_after_square.prod(dim=1)
-        coef = det1.sqrt() * det2.rsqrt()
-        scales = scales_after_square.sqrt()
-        return scales, opacity * coef[..., None]
+        scales, coef = self._filtered_scaling_and_coef()
+        return scales, self.get_opacity * coef
 
     def get_appearance_embedding(self, idx):
         return self._appearance_embeddings[idx]
@@ -523,17 +513,11 @@ class GaussianModel:
         current_opacity_with_filter = self.get_opacity_with_3D_filter
         opacities_new = torch.min(current_opacity_with_filter, torch.ones_like(current_opacity_with_filter) * 0.01)
 
-        # apply 3D filter
         scales = self.get_scaling
-
-        scales_square = torch.square(scales)
-        det1 = scales_square.prod(dim=1)
-
-        scales_after_square = scales_square + torch.square(self.filter_3D)
-        det2 = scales_after_square.prod(dim=1)
-        coef = torch.sqrt(det1 / det2)
-        opacities_new = opacities_new / coef[..., None]
-        opacities_new = self.inverse_opacity_activation(opacities_new)
+        filtered_scales = torch.hypot(scales, self.filter_3D)
+        rcoef = (filtered_scales / scales).prod(dim=1, keepdim=True)
+        opacities_new = opacities_new * rcoef
+        opacities_new = self.inverse_opacity_activation(torch.clamp(opacities_new, 0, 0.9999))
 
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
